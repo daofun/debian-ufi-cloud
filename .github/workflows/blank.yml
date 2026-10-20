@@ -1,20 +1,30 @@
 name: Build Debian for MSM8916 随身WiFi
 
 # ============================================================================
-# 用法：
-#   1. Fork Mio-sha512/OpenStick-Builder（切到 debian 分支）
-#   2. 把本文件覆盖到  .github/workflows/build.yml
-#   3. Actions → Build Debian for MSM8916 随身WiFi → Run workflow
-#   4. 选板型、填包名 → 开跑（约 20-40 分钟）→ 下载 artifact
+# 这个 workflow 不需要你 Fork OpenStick-Builder —— 它会自动拉取上游源码。
+# 把它放进任意（哪怕是空的）仓库，Actions 里点一下就能出刷机包。
 #
-# 说明：本 workflow 只是在原仓库构建流程外面包了一层「可视化参数注入」，
-#       真正的构建逻辑仍是 scripts/ 下的六个脚本，用的是 postmarketOS
-#       为 MSM8916 预编译的内核（不需要自己编译内核，所以很快）。
+# 已按 Mio-sha512/OpenStick-Builder @ debian 分支的真实脚本结构校准：
+#   · RELEASE / HOST_NAME  → 环境变量注入（不是 sed 替换文本）
+#   · DTB                  → configs/extlinux.conf 的 fdt 行
+#   · 额外软件包           → 插进 setup.sh 的多行 apt install 续行块
 # ============================================================================
 
 on:
   workflow_dispatch:
     inputs:
+
+      builder_repo:
+        description: '上游构建器仓库（一般不用改）'
+        required: false
+        default: 'Mio-sha512/OpenStick-Builder'
+        type: string
+
+      builder_ref:
+        description: '上游分支：debian / ubuntu-24.04 / alpine'
+        required: false
+        default: 'debian'
+        type: string
 
       device:
         description: '设备板型（决定用哪个 DTB）'
@@ -22,48 +32,49 @@ on:
         default: 'thwc-ufi001c'
         type: choice
         options:
-          - thwc-ufi001c      # UFI001B / UFI001C / UFI003 / ufi103s / w001 / sp970 兜底
-          - yiming-uz801v3    # UZ801 v3（默认最稳的型号）
+          - thwc-ufi001c      # UFI001B / UFI001C / UFI003 / ufi103s / w001
+          - yiming-uz801v3    # UZ801 v3（上游默认，最稳）
           - thwc-uf896        # UF896
-          - jz01-45-v33       # JZ01-45 / JZ02V10
-          - fy-mf800          # MF800 / MF800B-E
+          - jz01-45-v33       # JZ01-45 / JZ02V10（仓库自带 dtb）
+          - fy-mf800          # MF800 / MF800B-E（仓库自带 dtb）
 
       suite:
-        description: 'Debian 版本'
+        description: 'Debian 版本（对应上游 RELEASE 变量）'
         required: true
         default: 'bookworm'
         type: choice
         options:
-          - bookworm          # Debian 12，推荐
-          - bullseye          # Debian 11，最省内存
-          - trixie            # Debian 13，较新
+          - bookworm          # Debian 12 —— 512MB 内存推荐
+          - bullseye          # Debian 11 —— 最省内存
+          - trixie            # Debian 13 —— 较新，内存占用略高
+          - stable            # 跟随上游默认值（当前即 trixie）
 
       extra_packages:
-        description: '额外预装软件包（空格分隔的 Debian 包名，不要写 OpenWrt 的 ipk 名！）'
+        description: '额外预装包（空格分隔的 Debian 包名，不要写 luci-app-* 这类 ipk 名）'
         required: false
-        default: 'htop vim curl wget git nano net-tools'
+        default: 'htop vim nano net-tools wget curl git'
         type: string
 
       hostname:
-        description: '主机名'
+        description: '主机名（对应上游 HOST_NAME 变量）'
         required: false
         default: 'openstick'
         type: string
 
       ssh_public_key:
-        description: '（可选）SSH 公钥，填了就能免密登录'
+        description: '（可选）SSH 公钥，形如 ssh-ed25519 AAAA... user@host'
         required: false
         default: ''
         type: string
 
       upload_release:
-        description: '构建完成后发布到 Releases（而不是只存 artifact）'
+        description: '构建完成后发布到 Releases'
         required: false
         default: false
         type: boolean
 
       release_tag:
-        description: 'Release 标签（仅当上面勾选时有效）'
+        description: 'Release 标签（留空自动生成）'
         required: false
         default: ''
         type: string
@@ -72,12 +83,6 @@ on:
 permissions:
   contents: write
 
-env:
-  DEVICE_BOARD: ${{ inputs.device }}
-  DEBIAN_SUITE: ${{ inputs.suite }}
-  EXTRA_PKGS:   ${{ inputs.extra_packages }}
-  HOSTNAME:     ${{ inputs.hostname }}
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -85,88 +90,123 @@ jobs:
     steps:
 
       # ---------------------------------------------------------------
-      - name: 检出代码（含子模块）
-        uses: actions/checkout@v4
+      # 1. 自己的仓库（为了把 flash/ 脚本一起打进产物）
+      - name: 检出本仓库
+        uses: actions/checkout@v6
         with:
-          submodules: true      # lk2nd / qtestsign / qhypstub / gt / libusbgx
+          path: self
 
       # ---------------------------------------------------------------
+      # 2. 拉取上游构建器（这才是 scripts/ configs/ dtbs/ 的来源）
+      - name: 检出 OpenStick-Builder 源码
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.builder_repo }}
+          ref: ${{ inputs.builder_ref }}
+          submodules: true          # lk2nd / qtestsign / qhypstub / gt / libusbgx
+          path: builder
+
+      - name: 展示上游结构
+        working-directory: builder
+        run: |
+          echo "分支: ${{ inputs.builder_ref }} @ $(git rev-parse --short HEAD)"
+          echo "--- scripts/ ---"; ls -1 scripts/
+          echo "--- configs/extlinux.conf ---"; cat configs/extlinux.conf
+          echo "--- dtbs/ ---"; ls -1 dtbs/
+
+      # =========================== 参数注入 ===========================
+
       - name: 注入设备板型（DTB）
+        working-directory: builder
         run: |
           set -e
-          echo "目标板型: ${{ inputs.device }}"
-          if [ -f configs/extlinux.conf ]; then
-            sed -i "s#msm8916-[a-z0-9_-]*\.dtb#msm8916-${{ inputs.device }}.dtb#g" configs/extlinux.conf
-            echo "--- configs/extlinux.conf ---"
-            cat configs/extlinux.conf
-          else
-            echo "::warning::未找到 configs/extlinux.conf，请手动确认 DTB 配置"
+          DTB="msm8916-${{ inputs.device }}.dtb"
+          echo "目标 DTB: $DTB"
+          if [ ! -f configs/extlinux.conf ]; then
+            echo "::error::configs/extlinux.conf 不存在，上游结构可能变了"
+            exit 1
           fi
+          # extlinux.conf 形如：fdt /dtbs/qcom/msm8916-yiming-uz801v3.dtb
+          sed -i "s#msm8916-[A-Za-z0-9_.-]*\.dtb#$DTB#g" configs/extlinux.conf
+          echo "--- 注入后 ---"
+          cat configs/extlinux.conf
+          grep -q "$DTB" configs/extlinux.conf || { echo "::error::DTB 注入失败"; exit 1; }
+          echo "::notice::DTB 已设为 $DTB"
 
-      # ---------------------------------------------------------------
-      - name: 注入 Debian 版本
+      - name: 注入额外软件包与 SSH 公钥
+        working-directory: builder
+        env:
+          PKGS:   ${{ inputs.extra_packages }}
+          SSHKEY: ${{ inputs.ssh_public_key }}
+          SUITE:  ${{ inputs.suite }}
         run: |
-          set -e
-          if grep -RqsE '\b(bookworm|bullseye|trixie|stable|testing)\b' scripts/debootstrap.sh; then
-            sed -i "s/\b\(bookworm\|bullseye\|trixie\)\b/${{ inputs.suite }}/g" scripts/debootstrap.sh
-            echo "已注入 Debian 版本: ${{ inputs.suite }}"
-          else
-            echo "::warning::scripts/debootstrap.sh 中未找到发行版代号，请手动修改"
-          fi
+          python3 - <<'PY'
+          import os, sys
 
-      # ---------------------------------------------------------------
-      - name: 注入额外软件包
-        run: |
-          set -e
-          PKGS="${{ inputs.extra_packages }}"
-          if [ -z "$PKGS" ]; then
-            echo "未指定额外软件包，跳过"
-            exit 0
-          fi
-          if grep -qsE '^[[:space:]]*apt(-get)?[[:space:]]+install' scripts/setup.sh; then
-            # 在 setup.sh 里第一条 apt install 行末尾追加包名
-            sed -i "0,/^\([[:space:]]*apt\(-get\)\?[[:space:]]\+install.*\)$/s//\1 $PKGS/" scripts/setup.sh
-            echo "已注入软件包: $PKGS"
-            grep -nE '^[[:space:]]*apt(-get)?[[:space:]]+install' scripts/setup.sh | head -5
-          else
-            echo "::warning::scripts/setup.sh 中未找到 apt install 行，" \
-                 "请手动把 [$PKGS] 加进包列表" >> $GITHUB_STEP_SUMMARY
-          fi
+          pkgs = os.environ.get("PKGS", "").split()
+          sshkey = os.environ.get("SSHKEY", "").strip()
+          path = "scripts/setup.sh"
 
-      # ---------------------------------------------------------------
-      - name: 注入主机名与 SSH 公钥
-        run: |
-          set -e
-          if [ -n "${{ inputs.hostname }}" ]; then
-            grep -Rqsl 'openstick' scripts/ 2>/dev/null && \
-              sed -i "s/\bopenstick\b/${{ inputs.hostname }}/g" scripts/setup.sh 2>/dev/null || true
-          fi
-          if [ -n "${{ inputs.ssh_public_key }}" ]; then
-            mkdir -p configs/inject
-            echo "${{ inputs.ssh_public_key }}" > configs/inject/authorized_keys
-            echo "SSH 公钥已写入 configs/inject/authorized_keys"
-            echo "::warning::SSH 公钥需 debootstrap.sh 里存在拷贝逻辑才会生效，" \
-                 "若无则刷机后手动写入 ~/.ssh/authorized_keys" >> $GITHUB_STEP_SUMMARY
-          fi
+          src = open(path, encoding="utf-8").read()
 
-      # ======================= 以下为原仓库构建流程 =======================
+          # --- 1) 额外软件包：插进多行续行的 apt install 块 ---
+          if pkgs:
+              anchor = "apt install -qqy --no-install-recommends \\\n"
+              idx = src.find(anchor)
+              if idx < 0:
+                  print("::error::setup.sh 里没找到 apt install 续行块，请手动添加包名")
+                  sys.exit(1)
+              pos = idx + len(anchor)
+              src = src[:pos] + "    " + " ".join(pkgs) + " \\\n" + src[pos:]
+              print(f"已注入软件包: {' '.join(pkgs)}")
+
+          # --- 2) SSH 公钥：追加到 setup.sh 末尾（在 chroot 里以 root 执行）---
+          if sshkey:
+              src += f"""
+          # --- injected SSH public key ---
+          mkdir -p /home/user/.ssh
+          echo '{sshkey}' > /home/user/.ssh/authorized_keys
+          chown -R user:user /home/user/.ssh
+          chmod 700 /home/user/.ssh
+          chmod 600 /home/user/.ssh/authorized_keys
+          """
+              print("已注入 SSH 公钥")
+
+          open(path, "w", encoding="utf-8").write(src)
+          PY
+
+          echo "--- setup.sh apt install 块（前 12 行）---"
+          sed -n '/apt install -qqy/,/hostapd/p' scripts/setup.sh | head -12
+
+      # ======================= 以下为上游原样构建流程 =======================
 
       - name: 安装依赖
+        working-directory: builder
         run: sudo sh -e scripts/install_deps.sh
 
       - name: 构建 hyp 与 lk2nd 引导
+        working-directory: builder
         run: sudo sh -e scripts/build_hyp_aboot.sh
 
       - name: 提取高通固件与分区表
+        working-directory: builder
         run: sudo sh -e scripts/extract_fw.sh
 
-      - name: 构建 Debian rootfs（debootstrap）
-        run: sudo sh -e scripts/debootstrap.sh
+      - name: 构建 Debian rootfs（mmdebstrap）
+        working-directory: builder
+        # RELEASE / HOST_NAME 是上游脚本用 ${RELEASE=stable} 读取的环境变量。
+        # sudo 默认会清环境变量，所以用 sudo env 显式带进去。
+        run: |
+          sudo env RELEASE="${{ inputs.suite }}" \
+                   HOST_NAME="${{ inputs.hostname }}" \
+                   sh -e scripts/debootstrap.sh
 
       - name: 构建 USB gadget-tools
+        working-directory: builder
         run: sudo sh -e scripts/build_gt.sh
 
       - name: 生成最终镜像
+        working-directory: builder
         run: sudo sh -e scripts/build_images.sh
 
       # =================================================================
@@ -176,17 +216,17 @@ jobs:
         run: |
           set -e
           mkdir -p dist
-          cp -a files/* dist/ 2>/dev/null || true
-          cp -a flash/* dist/ 2>/dev/null || true
+          cp -a builder/files/* dist/ 2>/dev/null || true
+          cp -a self/flash/* dist/ 2>/dev/null || true
+          echo "--- 产物清单 ---"
           ls -lh dist/
-          echo "tag=${{ inputs.release_tag || format('debian-{0}-{1}', inputs.device, github.run_number) }}" >> $GITHUB_OUTPUT
+          echo "tag=${{ inputs.release_tag || format('debian-{0}-{1}-{2}', inputs.suite, inputs.device, github.run_number) }}" >> $GITHUB_OUTPUT
 
-      - name: 打包成一键刷机 zip
+      - name: 打包一键刷机 zip
         run: |
           set -e
           cd dist
-          zip -r ../msm8916-debian-${{ inputs.device }}.zip . || \
-            (sudo apt-get install -y zip && zip -r ../msm8916-debian-${{ inputs.device }}.zip .)
+          zip -r ../msm8916-debian-${{ inputs.device }}-${{ inputs.suite }}.zip .
           cd ..
           ls -lh *.zip
 
@@ -199,20 +239,22 @@ jobs:
           |---|---|
           | 板型 DTB | \`msm8916-${{ inputs.device }}.dtb\` |
           | Debian | ${{ inputs.suite }} |
+          | 主机名 | ${{ inputs.hostname }} |
           | 额外软件 | \`${{ inputs.extra_packages }}\` |
+          | 上游 | ${{ inputs.builder_repo }} @ ${{ inputs.builder_ref }} |
 
           ### 刷机命令
 
           \`\`\`bash
-          # 1) EDL 模式备份原始分区（必做！）
+          # 1) EDL 模式备份基带分区（必做！丢了这个 4G 永久失效）
           for n in fsc fsg modem modemst1 modemst2 persist sec; do edl r \$n \$n.bin; done
 
-          # 2) EDL 刷入自建 aboot，重启进 fastboot
+          # 2) EDL 写入自建 aboot，重启进 fastboot
           edl w aboot aboot.mbn
           edl e boot
           edl reset
 
-          # 3) fastboot 刷入（注意 partition 必须第一个刷）
+          # 3) fastboot 刷入（partition 必须第一个刷）
           fastboot flash partition gpt_both0.bin
           fastboot flash aboot aboot.mbn
           fastboot flash hyp   hyp.mbn
@@ -222,7 +264,7 @@ jobs:
           fastboot flash boot   boot.bin
           fastboot flash rootfs rootfs.bin
 
-          # 4) 恢复基带校准分区（否则 4G 失效）
+          # 4) 写回基带校准分区
           for n in fsc fsg modem modemst1 modemst2 persist sec; do fastboot flash \$n \$n.bin; done
 
           fastboot reboot
@@ -230,21 +272,19 @@ jobs:
 
           ### 首次登录
 
-          - 用户名 \`user\` / 密码 \`1\`（进去立刻 \`passwd\` 改掉）
+          - 用户名 \`user\` / 密码 \`1\`（root 密码已禁用，用 \`sudo -i\`）
           - USB RNDIS：\`ssh user@192.168.5.1\`
           - 自带热点：SSID \`Openstick\` 密码 \`openstick\`，网关 192.168.4.1
-          - 若启动异常，进系统后改 DTB：
+          - 起不来多半是 DTB 选错，adb shell 进去改：
             \`sed -i 's/msm8916-${{ inputs.device }}/msm8916-<正确板型>/' /boot/extlinux/extlinux.conf\`
           EOF
 
       - name: 上传 artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: msm8916-debian-${{ inputs.device }}
-          path: |
-            msm8916-debian-${{ inputs.device }}.zip
-            files/*
-          if-no-files-found: warn
+          name: msm8916-debian-${{ inputs.device }}-${{ inputs.suite }}
+          path: msm8916-debian-${{ inputs.device }}-${{ inputs.suite }}.zip
+          if-no-files-found: error
           retention-days: 30
 
       - name: 发布到 Releases
@@ -253,7 +293,7 @@ jobs:
         with:
           tag_name: ${{ steps.pack.outputs.tag }}
           name: Debian ${{ inputs.suite }} for ${{ inputs.device }}
-          files: msm8916-debian-${{ inputs.device }}.zip
+          files: msm8916-debian-${{ inputs.device }}-${{ inputs.suite }}.zip
           body: |
             板型 DTB：`msm8916-${{ inputs.device }}.dtb`
             Debian 版本：${{ inputs.suite }}
@@ -261,7 +301,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 清理旧的工作流记录
+      - name: 清理旧工作流记录
         if: ${{ always() }}
         uses: Mattraks/delete-workflow-runs@v2
         with:
