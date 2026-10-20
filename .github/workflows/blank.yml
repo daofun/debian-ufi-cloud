@@ -27,12 +27,12 @@ on:
         type: string
 
       device:
-        description: '设备板型（决定用哪个 DTB）'
+        description: '设备板型（决定用哪个 DTB）⚠️UFI103S 请勿使用本 workflow，见 UFI103S专项说明.md'
         required: true
         default: 'thwc-ufi001c'
         type: choice
         options:
-          - thwc-ufi001c      # UFI001B / UFI001C / UFI003 / ufi103s / w001
+          - thwc-ufi001c      # UFI001B / UFI001C / UFI003 / w001
           - yiming-uz801v3    # UZ801 v3（上游默认，最稳）
           - thwc-uf896        # UF896
           - jz01-45-v33       # JZ01-45 / JZ02V10（仓库自带 dtb）
